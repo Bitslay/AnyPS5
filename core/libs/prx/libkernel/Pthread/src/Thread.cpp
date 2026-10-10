@@ -382,8 +382,13 @@ static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
 
 struct NativeThreadArgs {
     std::unique_ptr<ThreadArgs> guest;
+#ifdef _WIN32
+    HANDLE initializedEvent;
+    HANDLE startEvent;
+#else
     std::future<bool> start;
     std::promise<void> initialized;
+#endif
 };
 
 #ifdef _WIN32
@@ -410,13 +415,13 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
             SetThreadDescription(GetCurrentThread(), description.c_str());
             ApplyJobAffinity(*self, nullptr);
         }
-        args->initialized.set_value();
     } catch (...) {
-        args->initialized.set_exception(std::current_exception());
+        SetEvent(args->initializedEvent);
         return 0;
     }
-    if (!args->start.get())
-        return 0;
+    const auto startEvent = args->startEvent;
+    SetEvent(args->initializedEvent);
+    WaitForSingleObject(startEvent, INFINITE);
     auto guest = std::move(args->guest);
     args.reset();
     RunThread(std::move(guest));
@@ -477,7 +482,6 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         p->priority.store((*attr)->_schedpriority, std::memory_order_relaxed);
     }
     if (name) p->name = name;
-    std::promise<bool> start;
     auto args = std::make_unique<ThreadArgs>(ThreadArgs{entry, arg, p.get()});
 #ifdef _WIN32
     SYSTEM_INFO system{};
@@ -485,27 +489,27 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     if (p->stackSize < 16384 || p->stackSize > std::numeric_limits<unsigned>::max() - HOST_STACK_MARGIN - system.dwPageSize)
         throw std::runtime_error("scePthreadCreate: invalid Windows stack size");
     const std::size_t nativeStack = (p->stackSize + HOST_STACK_MARGIN + system.dwPageSize - 1) / system.dwPageSize * system.dwPageSize;
-    auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), start.get_future(), {}});
-    auto initialized = native->initialized.get_future();
+    const auto initializedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const auto startEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), initializedEvent, startEvent});
     const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(nativeStack), StartNativeThread, native.get(), 0, nullptr);
-    if (handle == 0)
+    if (handle == 0) {
+        CloseHandle(initializedEvent);
+        CloseHandle(startEvent);
         throw std::system_error(errno, std::generic_category(), "Creating guest thread");
+    }
     p->nativeHandle = reinterpret_cast<void*>(handle);
     native.release();
-    try {
-        initialized.get();
-    } catch (...) {
-        start.set_value(false);
-        WaitForSingleObject(p->nativeHandle, INFINITE);
-        CloseHandle(p->nativeHandle);
-        throw;
-    }
+    WaitForSingleObject(initializedEvent, INFINITE);
+    CloseHandle(initializedEvent);
     auto* published = p.release();
     *thread = published;
-    start.set_value(true);
+    SetEvent(startEvent);
+    CloseHandle(startEvent);
     if (detached)
         ReleaseThread(published);
 #else
+    std::promise<bool> start;
     const auto reserve = HostStackReserve();
     const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
     if (p->stackSize < 16384 || p->stackSize > std::numeric_limits<std::size_t>::max() - reserve - HOST_STACK_MARGIN - page)
